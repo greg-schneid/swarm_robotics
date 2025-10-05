@@ -148,15 +148,15 @@ class BrainProcessor(Node):
         else:
             new_state = "IDLE"
         
-        if new_state != self._state:
-            self._state = new_state
-            msg = BrainActionMsg()
-            msg.stamp = float(self.get_clock().now().nanoseconds) * 1e-9
-            msg.action = new_state
-            msg.beta_alpha_ratio = float(ratio)
-            msg.alpha_power = float(alpha)
-            msg.beta_power = float(beta)
-            self._emit(msg)
+        # Update state and always publish (not just on state changes)
+        self._state = new_state
+        msg = BrainActionMsg()
+        msg.stamp = float(self.get_clock().now().nanoseconds) * 1e-9
+        msg.action = new_state
+        msg.beta_alpha_ratio = float(ratio)
+        msg.alpha_power = float(alpha)
+        msg.beta_power = float(beta)
+        self._emit(msg)
     
     def calibrate(
         self,
@@ -270,7 +270,7 @@ class BrainProcessor(Node):
         metrics.data = [msg.beta_alpha_ratio, msg.alpha_power, msg.beta_power]
         self.brainaction_metrics_pub.publish(metrics)
         
-        self.get_logger().info(
+        self.get_logger().debug(
             f"[BrainProcessor] {msg.action:7s}  R={msg.beta_alpha_ratio:5.2f}  "
             f"α={msg.alpha_power:7.1f}  β={msg.beta_power:7.1f}"
         )
