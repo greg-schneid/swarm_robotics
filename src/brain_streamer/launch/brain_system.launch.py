@@ -32,6 +32,27 @@ def generate_launch_description():
         default_value='/workspaces/swarm_robotics/data',
         description='Directory path for CSV output files'
     )
+
+    udp_dest_host_arg = DeclareLaunchArgument(
+        'udp_dest_host', default_value='192.168.10.15',
+        description='Destination host/IP for UDP brain state'
+    )
+    udp_dest_port_arg = DeclareLaunchArgument(
+        'udp_dest_port', default_value='5005',
+        description='Destination UDP port for brain state'
+    )
+    udp_format_arg = DeclareLaunchArgument(
+        'udp_format', default_value='text',
+        description='Payload format: "text", "json", or "binary"'
+    )
+    include_ts_arg = DeclareLaunchArgument(
+        'include_timestamp', default_value='false',
+        description='Include UNIX timestamp in payload'
+    )
+    broadcast_arg = DeclareLaunchArgument(
+        'broadcast', default_value='true',
+        description='Enable UDP broadcast (sets SO_BROADCAST)'
+    )
     
     # Brain Streamer Node - reads from Muse headset
     brain_stream_node = Node(
@@ -54,10 +75,33 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
     )
+
+    data_streamer_node = Node(
+        package='data_streamer',
+        executable='data_streamer',
+        name='data_streamer',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'dest_host':         LaunchConfiguration('udp_dest_host'),
+            'dest_port':         LaunchConfiguration('udp_dest_port'),
+            'udp_format':        LaunchConfiguration('udp_format'),
+            'include_timestamp': LaunchConfiguration('include_timestamp'),
+            'broadcast':         LaunchConfiguration('broadcast'),
+        }]
+    )
     
     return LaunchDescription([
+        # args
         save_to_csv_arg,
         csv_output_dir_arg,
+        udp_dest_host_arg,
+        udp_dest_port_arg,
+        udp_format_arg,
+        include_ts_arg,
+        broadcast_arg,
+        # nodes
         brain_stream_node,
         brain_processor_node,
+        data_streamer_node,
     ])
