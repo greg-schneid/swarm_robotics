@@ -1,29 +1,16 @@
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray, String
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 from scipy.signal import iirnotch, butter, filtfilt, welch, detrend
 
-# ---------------------------------------------------------------------
-# Messages
-# ---------------------------------------------------------------------
-
-@dataclass
-class BrainData:
-    """One EEG sample (or a small chunk if you choose)."""
-    timestamp: float              # seconds (LSL local_clock() or inlet ts)
-    values: np.ndarray            # shape (C,) in μV (Muse order: TP9, AF7, AF8, TP10, AUX)
-
-
-@dataclass
-class BrainActionMsg:
-    stamp: float
-    action: str                   # "STOP" | "FORWARD" | "BOOST" | "IDLE"
-    beta_alpha_ratio: float
-    alpha_power: float
-    beta_power: float
+# Import ROS2 custom messages
+from swarm_messages.msg import BrainData, BrainActionMsg
 
 
 # ---------------------------------------------------------------------
@@ -52,7 +39,7 @@ def _bandpower_welch(sig: np.ndarray, fs: float, f_lo: float, f_hi: float) -> fl
 # BrainProcessor
 # ---------------------------------------------------------------------
 
-class BrainProcessor:
+class BrainProcessor(Node):
     """
     Real-time mental-state decoder (Relax vs Focus) with calibration.
     - Maintains a rolling buffer (seconds) of EEG
@@ -100,6 +87,43 @@ class BrainProcessor:
             "Boost":  "BOOST",
             "Idle":   "IDLE",
         }
+        self.fs = float(sample_rate)
+        self.labels = labels if labels else ["TP9", "AF7", "AF8", "TP10", "AUX"]
+        self.mains_hz = mains_hz
+
+        self.S = int(max(1, round(buffer_sec * self.fs)))  # samples in ring buffer
+        self.C = len(self.labels)
+        self._rb = np.zeros((self.S, self.C), dtype=np.float64)
+        self._write = 0
+        self._filled = 0
+
+        # thresholds learned in calibrate()
+        self.r_low: Optional[float] = None
+        self.r_high: Optional[float] = None
+        self.r_boost: Optional[float] = None
+
+        # bands
+        self.alpha = (8.0, 13.0)
+        self.beta  = (13.0, 30.0)
+
+        # outputs
+        self._state = "IDLE"
+        self._action_cb = action_callback
+
+        # user-friendly mapping if you want to expose human labels
+        self.action_map = {
+            "Relax":  "STOP",
+            "Focus":  "FORWARD",
+            "Boost":  "BOOST",
+            "Idle":   "IDLE",
+        }
+
+        self.brain_data_sub = self.create_subscription(BrainData, '/brain/raw', self.receive_data, 100)
+        self.brain_action_pub = self.create_publisher(String, '/brain/action', 10)
+        self.brainaction_metrics_pub = self.create_publisher(Float32MultiArray, '/brain/metrics', 10)
+
+        self.create_timer(1.0 / max(self.process_frequency, 1e-6), self.process_tick)
+        
 
     # ----------------- Public API -----------------
 
@@ -143,27 +167,38 @@ class BrainProcessor:
 
         if new_state != self._state:
             self._state = new_state
-            self._emit(BrainActionMsg(
-                stamp=self._now(),
-                action=new_state,
-                beta_alpha_ratio=float(ratio),
-                alpha_power=float(alpha),
-                beta_power=float(beta),
-            ))
+            msg = BrainActionMsg()
+            msg.stamp = float(self._now())
+            msg.action = new_state
+            msg.beta_alpha_ratio = float(ratio)
+            msg.alpha_power = float(alpha)
+            msg.beta_power = float(beta)
+            self._emit(msg)
     
-    def calibrate(self, relaxed_sec: float = 10.0, focus_sec: float = 10.0) -> Tuple[float, float, float]:
+    def calibrate(
+        self,
+        relaxed_sec: float = 10.0,
+        focus_sec: float = 10.0,
+        interactive: bool = True,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[float, float, float]:
         """
         Blocking calibration:
           1) Relaxed (eyes closed) relaxed_sec seconds
           2) Focus (mental math) focus_sec seconds
         Returns (r_low, r_high, r_boost).
         """
+        log = logger if logger else print
+        
         # Accumulate ratios during two phases
         relaxed_ratios: List[float] = []
         focus_ratios:   List[float] = []
 
         # phase 1: relaxed
-        input(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s. Enter when ready...")
+        if interactive:
+            input(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s. Enter when ready...")
+        else:
+            log(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s starting now.")
         
         t0 = self._now()
         while self._now() - t0 < relaxed_sec:
@@ -172,7 +207,10 @@ class BrainProcessor:
                 relaxed_ratios.append(float(r))
 
         # phase 2: focus
-        input(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s. Enter when ready...")
+        if interactive:
+            input(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s. Enter when ready...")
+        else:
+            log(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s starting now.")
 
         t0 = self._now()
         while self._now() - t0 < focus_sec:

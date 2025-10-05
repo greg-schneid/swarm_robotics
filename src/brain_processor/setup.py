@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'brain-processor'
+package_name = 'brain_processor'
 
 setup(
     name=package_name,
