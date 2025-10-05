@@ -33,38 +33,12 @@ class BrainStream(Node):
         self.get_logger().info('Resolving LSL stream…')
         self._get_stream()
 
-        self.processor = BrainProcessor(
-            sample_rate=self.receive_frequency,
-            labels=self.labels,
-            mains_hz=mains_hz,
-            action_callback=self._on_action
-        )
-
-        # Optional: do a quick, blocking calibration at startup
-        self.get_logger().info('Calibration starting…')
-        time.sleep(2.0)  # Pre-fill buffer ~2 s before we calibrate
-        try:
-            self.processor.calibrate(relaxed_sec=10.0, focus_sec=10.0, interactive=False, logger=self.get_logger().info)
-            self.get_logger().info('Calibration complete.')
-        except RuntimeError as exc:
-            self.get_logger().warning(f'Calibration skipped: {exc}')
-
         # Start streaming in a background thread
         self._stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
         self._stream_thread.start()
 
-        # ROS timers for processing and summaries
-        self.create_timer(1.0 / max(self.process_frequency, 1e-6), self._process_tick)
+        # ROS timer for summaries
         self.create_timer(self.summary_period, self.publish_data)
-
-    def _on_action(self, action_msg: BrainActionMsg):
-        # Publish the action message
-        self.action_pub.publish(action_msg)
-
-        self.get_logger().info(
-            f"Action: {action_msg.action} | R={action_msg.beta_alpha_ratio:.2f} "
-            f"α={action_msg.alpha_power:.2f} β={action_msg.beta_power:.2f}"
-        )
 
     def _start_stream(self):
         self.get_logger().info('Starting muselsl stream…')
@@ -127,17 +101,15 @@ class BrainStream(Node):
         if not self.inlet:
             raise RuntimeError("Stream inlet not initialized.")
 
-        while not self.shutdown_event.is_set():
+        while rclpy.ok():
             sample, ts = self.inlet.pull_sample(timeout=1.0)
-            if sample is None:
+            if sample is None or ts is None:
                 continue
 
             # Create ROS2 BrainData message
             data = BrainData()
             data.timestamp = float(ts)
             data.values = [float(v) for v in sample]
-            
-            self.processor.receive_data(data)
 
             try:
                 self.data_queue.put_nowait(data)
@@ -150,18 +122,13 @@ class BrainStream(Node):
                 self.data_queue.put_nowait(data)
 
             # Publish ROS2 BrainData message
-            self.brain_data_pub.publish(data)
-            
-            # Also publish raw data as Float32MultiArray for backwards compatibility
-            msg = Float32MultiArray()
-            msg.data = list(map(float, sample))
-            self.raw_pub.publish(msg)
+            self.raw_pub.publish(data)
 
 
     def publish_data(self):
         """Calculate and print average of brain data from the last 5 seconds."""
         current_time = time.time()
-        cutoff_time = current_time - 5.0  # 5 seconds ago
+        cutoff_time = current_time - self.process_frequency  # process_frequency seconds ago
         
         # Collect all data from queue and filter for last 5 seconds
         recent_data = []
@@ -197,7 +164,7 @@ class BrainStream(Node):
             self.get_logger().debug('No data available in the last 5 seconds.')
 
     def sample_data(self, num_samples=10, timeout=2.0):
-        if not hasattr(self, 'inlet'):
+        if not self.inlet:
             raise RuntimeError("Stream inlet not initialized.")
         samples = []
         timestamps = []
@@ -207,10 +174,7 @@ class BrainStream(Node):
                 samples.append(sample)
                 timestamps.append(ts)
         return np.array(samples), np.array(timestamps)
-
-    def _process_tick(self):
-        self.processor.process_tick()
-
+    
     def __del__(self):
         self.stop()
 
@@ -221,10 +185,8 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('BrainStream interrupted, shutting down.')
+        pass
     finally:
-        node.stop()
-        node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == "__main__":

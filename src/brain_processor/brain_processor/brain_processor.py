@@ -2,8 +2,6 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String
 
-from __future__ import annotations
-
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -50,43 +48,13 @@ class BrainProcessor(Node):
 
     def __init__(
         self,
-        *,
         sample_rate: float = 256.0,
         labels: Optional[List[str]] = None,           # default Muse order used if None
-        buffer_sec: float = 4.0,                      # processing window
+        buffer_sec: float = 4.0,                       # processing window
         mains_hz: float = 60.0,                       # set 50.0 if needed
         action_callback: Optional[Callable[[BrainActionMsg], None]] = None,
     ):
-        self.fs = float(sample_rate)
-        self.labels = labels if labels else ["TP9", "AF7", "AF8", "TP10", "AUX"]
-        self.mains_hz = mains_hz
-
-        self.S = int(max(1, round(buffer_sec * self.fs)))  # samples in ring buffer
-        self.C = len(self.labels)
-        self._rb = np.zeros((self.S, self.C), dtype=np.float64)
-        self._write = 0
-        self._filled = 0
-
-        # thresholds learned in calibrate()
-        self.r_low: Optional[float] = None
-        self.r_high: Optional[float] = None
-        self.r_boost: Optional[float] = None
-
-        # bands
-        self.alpha = (8.0, 13.0)
-        self.beta  = (13.0, 30.0)
-
-        # outputs
-        self._state = "IDLE"
-        self._action_cb = action_callback
-
-        # user-friendly mapping if you want to expose human labels
-        self.action_map = {
-            "Relax":  "STOP",
-            "Focus":  "FORWARD",
-            "Boost":  "BOOST",
-            "Idle":   "IDLE",
-        }
+        super().__init__('brain_processor')
         self.fs = float(sample_rate)
         self.labels = labels if labels else ["TP9", "AF7", "AF8", "TP10", "AUX"]
         self.mains_hz = mains_hz
@@ -119,10 +87,13 @@ class BrainProcessor(Node):
         }
 
         self.brain_data_sub = self.create_subscription(BrainData, '/brain/raw', self.receive_data, 100)
-        self.brain_action_pub = self.create_publisher(String, '/brain/action', 10)
+        self.brain_action_pub = self.create_publisher(BrainActionMsg, '/brain/action', 10)
         self.brainaction_metrics_pub = self.create_publisher(Float32MultiArray, '/brain/metrics', 10)
 
-        self.create_timer(1.0 / max(self.process_frequency, 1e-6), self.process_tick)
+        self.create_timer(1.0 / 5.0, self.process_tick)
+
+        # Calibration settings
+        self.attempted_calibration = False
         
 
     # ----------------- Public API -----------------
@@ -168,7 +139,7 @@ class BrainProcessor(Node):
         if new_state != self._state:
             self._state = new_state
             msg = BrainActionMsg()
-            msg.stamp = float(self._now())
+            msg.stamp = self._now()
             msg.action = new_state
             msg.beta_alpha_ratio = float(ratio)
             msg.alpha_power = float(alpha)
@@ -278,12 +249,30 @@ class BrainProcessor(Node):
     def _emit(self, msg: BrainActionMsg) -> None:
         if self._action_cb:
             self._action_cb(msg)
-        else:
-            print(f"[BrainProcessor] {msg.action:7s}  R={msg.beta_alpha_ratio:5.2f}  "
-                  f"α={msg.alpha_power:7.1f}  β={msg.beta_power:7.1f}")
+        
+        # Publish the action message
+        self.brain_action_pub.publish(msg)
+        
+        # Publish metrics as Float32MultiArray
+        metrics = Float32MultiArray()
+        metrics.data = [msg.beta_alpha_ratio, msg.alpha_power, msg.beta_power]
+        self.brainaction_metrics_pub.publish(metrics)
+        
+        self.get_logger().info(
+            f"[BrainProcessor] {msg.action:7s}  R={msg.beta_alpha_ratio:5.2f}  "
+            f"α={msg.alpha_power:7.1f}  β={msg.beta_power:7.1f}"
+        )
 
-    @staticmethod
-    def _now() -> float:
-        # monotonic-ish wall clock is fine here
-        import time
-        return time.time()
+    def _now(self) -> float:
+        """Return current time in seconds."""
+        return float(self.get_clock().now().nanoseconds) * 1e-9
+
+if __name__ == '__main__':
+    rclpy.init()
+    node = BrainProcessor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rclpy.shutdown()
