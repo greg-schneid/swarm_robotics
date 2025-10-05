@@ -54,7 +54,7 @@ class BrainProcessor(Node):
         buffer_sec: float = 4.0,                       # processing window
         mains_hz: float = 60.0,                       # set 50.0 if needed
         action_callback: Optional[Callable[[BrainActionMsg], None]] = None,
-        use_default_thresholds: bool = True,          # use defaults immediately
+        use_default_thresholds: bool = False,          # use defaults immediately
     ):
         super().__init__('brain_processor')
         self.fs = float(sample_rate)
@@ -67,6 +67,8 @@ class BrainProcessor(Node):
         self._rb = np.zeros((self.S, self.C), dtype=np.float64)
         self._write = 0
         self._filled = 0
+        self._last_data_time: Optional[float] = None
+        self._data_stale_warned = False
 
         # thresholds learned in calibrate() or set to defaults
         if use_default_thresholds:
@@ -110,6 +112,7 @@ class BrainProcessor(Node):
         # Calibration settings
         self.attempted_calibration = False
         self.calibrating = False
+        self._calibration_buffer: List[np.ndarray] = []  # Stores samples during calibration
     
     def _on_connected(self, msg: Bool) -> None:
         if msg.data and not self.attempted_calibration and not self.calibrating and not self.use_default_thresholds:
@@ -126,7 +129,14 @@ class BrainProcessor(Node):
             else:
                 # wrong shape, drop
                 return
+        
+        # If calibrating, also store in calibration buffer
+        if self.calibrating:
+            self._calibration_buffer.append(v.copy())
+        
         self._push_row(v)
+        self._last_data_time = self._now()
+        self._data_stale_warned = False
 
     def process_tick(self) -> None:
         """
@@ -135,6 +145,19 @@ class BrainProcessor(Node):
         """
         if self._filled < int(self.fs * 1.5):  # wait until ~1.5s buffered
             return
+
+        # Guard against stale feed
+        if self._last_data_time is not None:
+            stale_sec = self._now() - self._last_data_time
+            if stale_sec > 2.0:
+                if not self._data_stale_warned:
+                    self.get_logger().warning(
+                        f"Brain data stream stale for {stale_sec:.1f}s; skipping processing."
+                    )
+                    self._data_stale_warned = True
+                return
+            else:
+                self._data_stale_warned = False
 
         alpha, beta, ratio = self._summarize_ratio(self._window())
 
@@ -170,48 +193,40 @@ class BrainProcessor(Node):
         self,
         relaxed_sec: float = 10.0,
         focus_sec: float = 10.0,
-        interactive: bool = True,   # if False, no input() prompts
     ) -> Tuple[float, float, float]:
         """
-        Blocking calibration:
+        Non-blocking calibration:
           1) Relaxed (eyes closed) relaxed_sec seconds
           2) Focus (mental math) focus_sec seconds
         Returns (r_low, r_high, r_boost).
         """
         self.calibrating = True
         
-        # Accumulate ratios during two phases
-        relaxed_ratios: List[float] = []
-        focus_ratios:   List[float] = []
+        # Phase 1: Relaxed
+        min_relaxed_samples = max(10, int(relaxed_sec * self.fs * 0.5))
+        relaxed_ratios = self._collect_phase_ratios(
+            phase_name="RELAXED",
+            phase_index=1,
+            target_duration=relaxed_sec,
+            min_samples=min_relaxed_samples
+        )
 
-        # phase 1: relaxed
-        for i in range(3, 0, -1):
-            self.get_logger().info(f"[BrainProcessor] Calibration phase 1: RELAXED starting in {i}...")
-            self.get_clock().sleep_for(Duration(seconds=1))
-            rclpy.spin_once(self, timeout_sec=0.0)  # Process incoming messages
-        
-        t0 = self._now()
-        while self._now() - t0 < relaxed_sec:
-            rclpy.spin_once(self, timeout_sec=0.01)  # Process incoming messages
-            if self._filled >= int(2 * self.fs):
-                _, _, r = self._summarize_ratio(self._window())
-                relaxed_ratios.append(float(r))
+        # Phase 2: Focus
+        min_focus_samples = max(10, int(focus_sec * self.fs * 0.5))
+        focus_ratios = self._collect_phase_ratios(
+            phase_name="FOCUS",
+            phase_index=2,
+            target_duration=focus_sec,
+            min_samples=min_focus_samples
+        )
 
-        # phase 2: focus
-        for i in range(3, 0, -1):
-            self.get_logger().info(f"[BrainProcessor] Calibration phase 2: FOCUS starting in {i}...")
-            self.get_clock().sleep_for(Duration(seconds=1))
-            rclpy.spin_once(self, timeout_sec=0.0)  # Process incoming messages
-
-        t0 = self._now()
-        while self._now() - t0 < focus_sec:
-            rclpy.spin_once(self, timeout_sec=0.01)  # Process incoming messages
-            if self._filled >= int(2 * self.fs):
-                _, _, r = self._summarize_ratio(self._window())
-                focus_ratios.append(float(r))
-
-        if not relaxed_ratios or not focus_ratios:
-            raise RuntimeError("Calibration failed: insufficient buffered data.")
+        if len(relaxed_ratios) < 5 or len(focus_ratios) < 5:
+            self.get_logger().warning(
+                f"Calibration aborted: collected {len(relaxed_ratios)} relaxed and {len(focus_ratios)} focus "
+                f"ratios (need at least 5 each)."
+            )
+            self.calibrating = False
+            return float('nan'), float('nan'), float('nan')
 
         r_relax = float(np.median(relaxed_ratios))
         r_focus = float(np.median(focus_ratios))
@@ -295,6 +310,87 @@ class BrainProcessor(Node):
     def _now(self) -> float:
         """Return current time in seconds."""
         return float(self.get_clock().now().nanoseconds) * 1e-9
+
+    def _wait_for_buffer(self, min_seconds: float, timeout: float) -> bool:
+        """Block until at least `min_seconds` of samples are buffered or timeout occurs."""
+        if min_seconds <= 0:
+            return True
+
+        needed_samples = int(self.fs * min_seconds)
+        start = self._now()
+
+        while rclpy.ok() and self._filled < needed_samples:
+            if (self._now() - start) >= timeout:
+                return False
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        return self._filled >= needed_samples
+
+    def _collect_phase_ratios(
+        self,
+        phase_name: str,
+        phase_index: int,
+        target_duration: float,
+        min_samples: int,
+    ) -> List[float]:
+        """Collect beta/alpha ratios for a calibration phase by waiting then computing from buffer."""
+        # Clear calibration buffer for this phase
+        self._calibration_buffer.clear()
+        
+        self.get_logger().info(
+            f"[BrainProcessor] Prepare for phase {phase_index}: {phase_name}."
+        )
+        
+        # Countdown
+        for i in range(3, 0, -1):
+            self.get_logger().info(
+                f"[BrainProcessor] Calibration phase {phase_index}: {phase_name} starting in {i}..."
+            )
+            self.get_clock().sleep_for(Duration(seconds=1))
+            rclpy.spin_once(self, timeout_sec=0.0)
+
+        # Start collecting data
+        self.calibrating = True
+        phase_start = self._now()
+        
+        self.get_logger().info(
+            f"[BrainProcessor] Collecting {phase_name} data for {target_duration}s..."
+        )
+        
+        # Wait for the full duration while spinning to receive data
+        while rclpy.ok() and (self._now() - phase_start) < target_duration:
+            rclpy.spin_once(self, timeout_sec=0.01)
+        
+        # Stop collecting for this phase
+        self.calibrating = False
+        
+        # Now compute ratios from the collected buffer
+        ratios: List[float] = []
+        if len(self._calibration_buffer) < min_samples:
+            self.get_logger().warning(
+                f"[BrainProcessor] Phase {phase_index} ({phase_name}) captured {len(self._calibration_buffer)} samples; "
+                f"needed {min_samples}."
+            )
+            return ratios
+        
+        # Convert buffer to numpy array
+        cal_data = np.array(self._calibration_buffer)
+        
+        # Compute ratios using sliding windows
+        window_size = int(2 * self.fs)  # 2 second windows
+        step_size = int(0.5 * self.fs)  # 0.5 second steps
+        
+        for i in range(0, len(cal_data) - window_size + 1, step_size):
+            window = cal_data[i:i+window_size, :]
+            if window.shape[0] >= window_size:
+                _, _, ratio = self._summarize_ratio(window)
+                ratios.append(float(ratio))
+        
+        self.get_logger().info(
+            f"[BrainProcessor] Phase {phase_index} ({phase_name}) computed {len(ratios)} ratios from {len(cal_data)} samples."
+        )
+        
+        return ratios
 
 
 def main(args=None):
