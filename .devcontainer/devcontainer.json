@@ -1,4 +1,3 @@
-
 {
   "name": "ros2-jazzy-dev",
   "privileged": true,
@@ -11,21 +10,21 @@
       "installZsh": false,
       "installOhMyZsh": false,
       "upgradePackages": false,
-      "username": "brain-streamer",
+      "username": "ubuntu",
       "uid": "1000",
       "gid": "1000"
     }
   },
   "updateRemoteUserUID": true,
-  "remoteUser": "brain-streamer",
-  "workspaceFolder": "/home/brain-streamer/brain_streamer_ros",
+  "remoteUser": "ubuntu",
+  "containerUser": "ubuntu",
+  "workspaceFolder": "/workspaces/swarm_robotics",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/swarm_robotics,type=bind",
   "mounts": [
-    "source=${localWorkspaceFolder}/src,target=/home/brain-streamer/brain_streamer_ros/src,type=bind",
-    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/brain-streamer/.ssh,type=bind,consistency=cached",
-    "source=${localWorkspaceFolder}/.git,target=/home/brain-streamer/brain_streamer_ros/.git,type=bind",
-    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/brain-streamer/.gitconfig,type=bind,consistency=cached"
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/ubuntu/.ssh,type=bind,consistency=cached",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/ubuntu/.gitconfig,type=bind,consistency=cached"
   ],
-  "postCreateCommand": "bash -c 'mkdir -p /home/brain-streamer/brain_streamer_ros/src && echo \"if [ -f /home/brain-streamer/brain_streamer_ros/install/setup.bash ]; then source /home/brain-streamer/brain_streamer_ros/install/setup.bash; fi\" >> ~/.bashrc && source /opt/ros/jazzy/setup.bash && cd /home/brain-streamer/brain_streamer_ros && colcon build --symlink-install'",
+  "postCreateCommand": "bash -c 'sudo chown -R ubuntu:ubuntu /workspaces/swarm_robotics 2>/dev/null || true && mkdir -p /workspaces/swarm_robotics/src && echo \"if [ -f /workspaces/swarm_robotics/install/setup.bash ]; then source /workspaces/swarm_robotics/install/setup.bash; fi\" >> ~/.bashrc && source /opt/ros/jazzy/setup.bash'",
   "containerEnv": {
     "GIT_EDITOR": "nano"
   },
