@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y \
     bash-completion \
     build-essential \
     bluez bluez-tools bluetooth rfkill dbus \
+    python3-tk tk-dev libx11-6 libxext6 libxrender1 libxft2 libxinerama1 libxi6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install liblsl - required for muselsl

@@ -77,7 +77,7 @@ class BrainProcessor(Node):
         self.declare_parameter('state_smooth_tau', 0.8)   # seconds
         self.declare_parameter('min_spread', 1.0)         # dB units, safer than 0.1 for stability
 
-        self.declare_parameter('adapt_anchors', True)
+        self.declare_parameter('adapt_anchors', False)
         self.declare_parameter('adapt_rate', 0.005)
         self.declare_parameter('edge_low', 0.15)
         self.declare_parameter('edge_high', 0.85)
