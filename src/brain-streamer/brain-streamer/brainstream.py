@@ -1,3 +1,6 @@
+import rclpy
+from rclpy.node import Node
+
 from pylsl import StreamInlet, resolve_streams
 import subprocess
 import time
@@ -7,7 +10,7 @@ from typing import Optional, List
 from concurrency import MultiThread, run_async
 from brain_processor import BrainProcessor, BrainData, BrainActionMsg
 
-class BrainStream(MultiThread):
+class BrainStream(Node):
     def __init__(self, process_frequency: int = 5, mains_hz: float = 60.0):
         super().__init__()
         self.receive_frequency = 256  # Hz
