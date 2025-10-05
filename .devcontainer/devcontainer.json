@@ -1,0 +1,53 @@
+
+{
+  "name": "ros2-jazzy-dev",
+  "privileged": true,
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "installOhMyZsh": false,
+      "upgradePackages": false,
+      "username": "brain-streamer",
+      "uid": "1000",
+      "gid": "1000"
+    }
+  },
+  "updateRemoteUserUID": true,
+  "remoteUser": "brain-streamer",
+  "workspaceFolder": "/home/brain-streamer/brain_streamer_ros",
+  "mounts": [
+    "source=${localWorkspaceFolder}/src,target=/home/brain-streamer/brain_streamer_ros/src,type=bind",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/brain-streamer/.ssh,type=bind,consistency=cached",
+    "source=${localWorkspaceFolder}/.git,target=/home/brain-streamer/brain_streamer_ros/.git,type=bind",
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/brain-streamer/.gitconfig,type=bind,consistency=cached"
+  ],
+  "postCreateCommand": "bash -c 'mkdir -p /home/brain-streamer/brain_streamer_ros/src && echo \"if [ -f /home/brain-streamer/brain_streamer_ros/install/setup.bash ]; then source /home/brain-streamer/brain_streamer_ros/install/setup.bash; fi\" >> ~/.bashrc && source /opt/ros/jazzy/setup.bash && cd /home/brain-streamer/brain_streamer_ros && colcon build --symlink-install'",
+  "containerEnv": {
+    "GIT_EDITOR": "nano"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.debugpy",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-themes",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cmake",
+        "ms-azuretools.vscode-docker",
+        "visualstudioexptteam.intellicode-api-usage-examples",
+        "visualstudioexptteam.vscodeintellicode",
+        "github.copilot",
+        "github.copilot-chat"
+      ],
+      "settings": {
+        "terminal.integrated.shell.linux": "/bin/bash"
+      }
+    }
+  }
+}
