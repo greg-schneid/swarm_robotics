@@ -18,6 +18,7 @@ from swarm_messages.msg import BrainData, BrainActionMsg
 class BrainStream(Node):
     def __init__(self, process_frequency: int = 5, mains_hz: float = 60.0, summary_period: float = 5.0):
         super().__init__('brain_stream')
+        self.labels = ["TP9", "AF7", "AF8", "TP10", "AUX"]
         self.receive_frequency = 256  # Hz
         self.process_frequency = int(process_frequency)
         self.summary_period = summary_period
