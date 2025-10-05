@@ -11,7 +11,7 @@ import rclpy
 from pylsl import StreamInlet, resolve_streams
 from rclpy.node import Node
 import subprocess
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Bool
 
 from swarm_messages.msg import BrainData, BrainActionMsg
 
@@ -41,6 +41,7 @@ class BrainStream(Node):
         # Publishers for raw data and processed outputs
         self.raw_pub = self.create_publisher(BrainData, '/brain/raw', 50)
         self.average_pub = self.create_publisher(Float32MultiArray, 'brain/raw_average', 10)
+        self.connected_pb = self.create_publisher(Bool, '/brain/connected', 10)
 
         # LSL stream objects
         self.stream = None
@@ -56,6 +57,12 @@ class BrainStream(Node):
 
         # ROS timer for summaries
         self.create_timer(self.summary_period, self.publish_data)
+        self.create_timer(1.0, self._publish_connection_status)
+
+    def _publish_connection_status(self):
+        msg = Bool()
+        msg.data = self.inlet is not None
+        self.connected_pb.publish(msg)
 
     def _initialize_csv(self):
         """Initialize CSV file for logging raw brain data."""
@@ -68,13 +75,14 @@ class BrainStream(Node):
             csv_filename = f'brain_data_{timestamp}.csv'
             csv_path = os.path.join(self.csv_output_dir, csv_filename)
             
-            # Open CSV file and create writer
-            self.csv_file = open(csv_path, 'w', newline='', buffering=1)  # Line buffering
+            # Open CSV file with no buffering for immediate writes
+            self.csv_file = open(csv_path, 'w', newline='', buffering=1)
             self.csv_writer = csv.writer(self.csv_file)
             
             # Write header
             header = ['timestamp'] + self.labels
             self.csv_writer.writerow(header)
+            self.csv_file.flush()  # Ensure header is written immediately
             
             self.get_logger().info(f'CSV logging enabled. Saving to: {csv_path}')
         except Exception as e:
@@ -164,11 +172,12 @@ class BrainStream(Node):
             self.raw_pub.publish(data)
             
             # Write to CSV if enabled
-            if self.save_to_csv and self.csv_writer:
+            if self.save_to_csv and self.csv_writer and self.csv_file:
                 try:
                     with self.csv_lock:
                         row = [data.timestamp] + data.values
                         self.csv_writer.writerow(row)
+                        self.csv_file.flush()  # Flush after each write to ensure data is saved
                 except Exception as e:
                     self.get_logger().error(f'Failed to write to CSV: {e}')
 
@@ -232,16 +241,6 @@ class BrainStream(Node):
                 samples.append(sample)
                 timestamps.append(ts)
         return np.array(samples), np.array(timestamps)
-    
-    def __del__(self):
-        self.stop()
-        
-        # Ensure CSV file is closed
-        if self.csv_file and not self.csv_file.closed:
-            try:
-                self.csv_file.close()
-            except Exception:
-                pass
 
 
 def main(args=None):
@@ -250,8 +249,9 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info('Keyboard interrupt received, shutting down...')
     finally:
+        node.stop()  # Ensure CSV file is properly closed
         rclpy.shutdown()
 
 if __name__ == "__main__":

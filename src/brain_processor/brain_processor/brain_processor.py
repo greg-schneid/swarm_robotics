@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, String
+from rclpy.duration import Duration
+from std_msgs.msg import Float32MultiArray, Bool
 
 from typing import Callable, List, Optional, Tuple
 
@@ -59,6 +60,7 @@ class BrainProcessor(Node):
         self.fs = float(sample_rate)
         self.labels = labels if labels else ["TP9", "AF7", "AF8", "TP10", "AUX"]
         self.mains_hz = mains_hz
+        self.use_default_thresholds = use_default_thresholds
 
         self.S = int(max(1, round(buffer_sec * self.fs)))  # samples in ring buffer
         self.C = len(self.labels)
@@ -80,7 +82,7 @@ class BrainProcessor(Node):
             self.r_low: Optional[float] = None
             self.r_high: Optional[float] = None
             self.r_boost: Optional[float] = None
-            self.get_logger().warn("Calibration required before publishing actions.")
+            self.get_logger().info("No thresholds set. Calibrate should run before processing.")
 
         # bands
         self.alpha = (8.0, 13.0)
@@ -101,12 +103,18 @@ class BrainProcessor(Node):
         self.brain_data_sub = self.create_subscription(BrainData, '/brain/raw', self.receive_data, 100)
         self.brain_action_pub = self.create_publisher(BrainActionMsg, '/brain/action', 10)
         self.brainaction_metrics_pub = self.create_publisher(Float32MultiArray, '/brain/metrics', 10)
+        self.connected_sub = self.create_subscription(Bool, '/brain/connected', self._on_connected, 10)
 
         self.create_timer(1.0 / 5.0, self.process_tick)
 
         # Calibration settings
         self.attempted_calibration = False
-        self.calibrateing = False
+        self.calibrating = False
+    
+    def _on_connected(self, msg: Bool) -> None:
+        if msg.data and not self.attempted_calibration and not self.calibrating and not self.use_default_thresholds:
+            self.get_logger().info("Brain device connected. Starting calibration...")
+            self.calibrate()
 
     def receive_data(self, data: BrainData) -> None:
         """Push a sample (or small chunk shaped (C,)) into the ring buffer."""
@@ -170,32 +178,34 @@ class BrainProcessor(Node):
           2) Focus (mental math) focus_sec seconds
         Returns (r_low, r_high, r_boost).
         """
-        self.calibrateing = True
+        self.calibrating = True
         
         # Accumulate ratios during two phases
         relaxed_ratios: List[float] = []
         focus_ratios:   List[float] = []
 
         # phase 1: relaxed
-        if interactive:
-            input(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s. Enter when ready...")
-        else:
-            self.get_logger().info(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s starting now.")
+        for i in range(3, 0, -1):
+            self.get_logger().info(f"[BrainProcessor] Calibration phase 1: RELAXED starting in {i}...")
+            self.get_clock().sleep_for(Duration(seconds=1))
+            rclpy.spin_once(self, timeout_sec=0.0)  # Process incoming messages
         
         t0 = self._now()
         while self._now() - t0 < relaxed_sec:
+            rclpy.spin_once(self, timeout_sec=0.01)  # Process incoming messages
             if self._filled >= int(2 * self.fs):
                 _, _, r = self._summarize_ratio(self._window())
                 relaxed_ratios.append(float(r))
 
         # phase 2: focus
-        if interactive:
-            input(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s. Enter when ready...")
-        else:
-            self.get_logger().info(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s starting now.")
+        for i in range(3, 0, -1):
+            self.get_logger().info(f"[BrainProcessor] Calibration phase 2: FOCUS starting in {i}...")
+            self.get_clock().sleep_for(Duration(seconds=1))
+            rclpy.spin_once(self, timeout_sec=0.0)  # Process incoming messages
 
         t0 = self._now()
         while self._now() - t0 < focus_sec:
+            rclpy.spin_once(self, timeout_sec=0.01)  # Process incoming messages
             if self._filled >= int(2 * self.fs):
                 _, _, r = self._summarize_ratio(self._window())
                 focus_ratios.append(float(r))
@@ -211,7 +221,14 @@ class BrainProcessor(Node):
         self.r_high  = (r_relax * 0.3 + r_focus * 0.7)
         self.r_boost = (r_focus * 1.2)
         self.attempted_calibration = True
-        self.calibrateing = False
+        self.calibrating = False
+
+        self.get_logger().info(
+            f"[BrainProcessor] Calibration complete. "
+            f"Relaxed ratio ~{r_relax:.2f}, Focused ratio ~{r_focus:.2f}. "
+            f"Set thresholds: low={self.r_low:.2f}, high={self.r_high:.2f}, boost={self.r_boost:.2f}"
+        )
+
         return self.r_low, self.r_high, self.r_boost
 
     # ----------------- Internals -----------------
