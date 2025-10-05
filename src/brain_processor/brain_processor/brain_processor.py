@@ -1,20 +1,41 @@
-import rclpy
-from rclpy.node import Node
-from rclpy.duration import Duration
-from std_msgs.msg import Float32MultiArray, Bool
+#!/usr/bin/env python3
+"""
+brain-processor.py
 
-from typing import Callable, List, Optional, Tuple
+ROS2 node that subscribes to /brain/raw (swarm_messages/BrainData),
+computes a continuous mental-state value in [0,1] where:
+    0.0 = relaxed (alpha-dominant)
+    1.0 = focused (beta-dominant)
+and publishes it on /brain/state (std_msgs/Float32).
+
+Key steps:
+- 4 s ring buffer of EEG (TP9, AF7, AF8, TP10, AUX)
+- Band-pass 1–45 Hz + Notch (50/60 Hz)
+- Welch PSD → Alpha power (8–13 Hz) from TP9/TP10, Beta power (13–30 Hz) from AF7/AF8
+- Ratio r = Beta / Alpha
+- Calibration learns relaxed and focused anchors (r_relax, r_focus)
+- Normalize: state_raw = clamp((r - r_relax) / (r_focus - r_relax), 0, 1)
+- Smooth with exponential filter; optional slow drift adaptation of anchors
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.signal import iirnotch, butter, filtfilt, welch, detrend
 
-# Import ROS2 custom messages
-from swarm_messages.msg import BrainData, BrainActionMsg
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32, Float32MultiArray, Bool
+
+# Custom message from your package
+from swarm_messages.msg import BrainData
 
 
-# ---------------------------------------------------------------------
-# DSP helpers
-# ---------------------------------------------------------------------
+# ----------------------------- DSP helpers -----------------------------
 
 def _bandpass(sig: np.ndarray, fs: float, lo: float, hi: float, order: int = 4) -> np.ndarray:
     b, a = butter(order, [lo/(fs/2), hi/(fs/2)], btype='band')
@@ -25,8 +46,7 @@ def _notch(sig: np.ndarray, fs: float, mains: float = 60.0, Q: float = 30.0) -> 
     return filtfilt(b, a, sig)
 
 def _bandpower_welch(sig: np.ndarray, fs: float, f_lo: float, f_hi: float) -> float:
-    # 2-second Welch for decent resolution; adjust nperseg if fs differs
-    nps = max(64, int(fs * 2))
+    nps = max(64, int(fs * 2))  # ~2 s segments for decent resolution
     f, pxx = welch(sig, fs=fs, nperseg=nps, noverlap=nps // 2, window="hann")
     mask = (f >= f_lo) & (f < f_hi)
     if not np.any(mask):
@@ -34,229 +54,320 @@ def _bandpower_welch(sig: np.ndarray, fs: float, f_lo: float, f_hi: float) -> fl
     return float(np.trapz(pxx[mask], f[mask]))
 
 
-# ---------------------------------------------------------------------
-# BrainProcessor
-# ---------------------------------------------------------------------
+# ----------------------------- Node -----------------------------
 
 class BrainProcessor(Node):
     """
-    Real-time mental-state decoder (Relax vs Focus) with calibration.
-    - Maintains a rolling buffer (seconds) of EEG
-    - Filters (1–45 Hz) + Notch
-    - Computes Alpha (TP9/TP10, 8–13 Hz), Beta (AF7/AF8, 13–30 Hz)
-    - Uses Beta/Alpha ratio + hysteresis → actions
+    Continuous mental-state estimator:
+      - Keeps a ring buffer window of EEG
+      - Filters + PSD
+      - Beta/Alpha ratio → normalized to [0,1] via calibrated anchors
+      - Smoothed and published on /brain/state
     """
 
-    def __init__(
-        self,
-        sample_rate: float = 256.0,
-        labels: Optional[List[str]] = None,           # default Muse order used if None
-        buffer_sec: float = 4.0,                       # processing window
-        mains_hz: float = 60.0,                       # set 50.0 if needed
-        action_callback: Optional[Callable[[BrainActionMsg], None]] = None,
-        use_default_thresholds: bool = False,          # use defaults immediately
-    ):
+    def __init__(self):
         super().__init__('brain_processor')
-        self.fs = float(sample_rate)
-        self.labels = labels if labels else ["TP9", "AF7", "AF8", "TP10", "AUX"]
-        self.mains_hz = mains_hz
-        self.use_default_thresholds = use_default_thresholds
 
-        self.S = int(max(1, round(buffer_sec * self.fs)))  # samples in ring buffer
+        # ---------- Parameters (tunable) ----------
+        self.declare_parameter('fs', 256.0)                 # Muse nominal sample rate
+        self.declare_parameter('buffer_sec', 4.0)           # ring buffer seconds
+        self.declare_parameter('tick_hz', 5.0)              # processing cadence
+        self.declare_parameter('mains_hz', 60.0)            # set 50.0 if applicable
+
+        # Calibration durations (s)
+        self.declare_parameter('calib_relaxed_sec', 10.0)
+        self.declare_parameter('calib_focus_sec', 10.0)
+        # Smoothing time constant (s) for the final state
+        self.declare_parameter('state_smooth_tau', 0.8)
+        # Optional slow adaptation of anchors (EMA) when near edges
+        self.declare_parameter('adapt_anchors', True)
+        self.declare_parameter('adapt_rate', 0.005)         # small EMA step
+        self.declare_parameter('edge_low', 0.15)            # when state < edge_low, adapt relaxed anchor
+        self.declare_parameter('edge_high', 0.85)           # when state > edge_high, adapt focus anchor
+        # Minimum spread to avoid divide-by-near-zero (absolute, ratio units)
+        self.declare_parameter('min_spread', 0.1)
+
+        # Debug metrics publisher toggle
+        self.declare_parameter('publish_metrics', True)
+
+        # ---------- Load params ----------
+        self.fs = float(self.get_parameter('fs').value)
+        self.buffer_sec = float(self.get_parameter('buffer_sec').value)
+        self.tick_hz = float(self.get_parameter('tick_hz').value)
+        self.mains_hz = float(self.get_parameter('mains_hz').value)
+
+        self.calib_relaxed_sec = float(self.get_parameter('calib_relaxed_sec').value)
+        self.calib_focus_sec = float(self.get_parameter('calib_focus_sec').value)
+
+        self.state_smooth_tau = float(self.get_parameter('state_smooth_tau').value)
+        self.adapt_anchors = bool(self.get_parameter('adapt_anchors').value)
+        self.adapt_rate = float(self.get_parameter('adapt_rate').value)
+        self.edge_low = float(self.get_parameter('edge_low').value)
+        self.edge_high = float(self.get_parameter('edge_high').value)
+        self.min_spread = float(self.get_parameter('min_spread').value)
+
+        self.publish_metrics = bool(self.get_parameter('publish_metrics').value)
+
+        # ---------- Channel labels ----------
+        self.labels: List[str] = ["TP9", "AF7", "AF8", "TP10", "AUX"]
         self.C = len(self.labels)
+
+        # ---------- Ring buffer ----------
+        self.S = int(max(1, round(self.buffer_sec * self.fs)))
         self._rb = np.zeros((self.S, self.C), dtype=np.float64)
         self._write = 0
         self._filled = 0
         self._last_data_time: Optional[float] = None
         self._data_stale_warned = False
 
-        # thresholds learned in calibrate() or set to defaults
-        if use_default_thresholds:
-            # Default thresholds based on typical Beta/Alpha ratios
-            # These work reasonably well but calibration is recommended for best results
-            self.r_low: Optional[float] = 0.8    # Below this = STOP (very relaxed)
-            self.r_high: Optional[float] = 1.5   # Above this = FORWARD (focused)
-            self.r_boost: Optional[float] = 2.5  # Above this = BOOST (highly focused)
-            self.get_logger().info(
-                f"Using default thresholds: low={self.r_low:.2f}, high={self.r_high:.2f}, boost={self.r_boost:.2f}"
-            )
-        else:
-            self.r_low: Optional[float] = None
-            self.r_high: Optional[float] = None
-            self.r_boost: Optional[float] = None
-            self.get_logger().info("No thresholds set. Calibrate should run before processing.")
+        # ---------- Bands ----------
+        self.alpha_band = (8.0, 13.0)
+        self.beta_band = (13.0, 30.0)
 
-        # bands
-        self.alpha = (8.0, 13.0)
-        self.beta  = (13.0, 30.0)
+        # ---------- Anchors learned by calibration ----------
+        self.r_relax: Optional[float] = None
+        self.r_focus: Optional[float] = None
 
-        # outputs
-        self._state = "IDLE"
-        self._action_cb = action_callback
+        # ---------- State smoothing ----------
+        self._state_smoothed: float = 0.0  # starts at relaxed
+        self._last_tick_time = self._now()
 
-        # user-friendly mapping if you want to expose human labels
-        self.action_map = {
-            "Relax":  "STOP",
-            "Focus":  "FORWARD",
-            "Boost":  "BOOST",
-            "Idle":   "IDLE",
-        }
+        # ---------- Calibration machinery ----------
+        self._calibrating = False
+        self._cal_thread: Optional[threading.Thread] = None
+        self._cal_buffer_lock = threading.Lock()
+        self._cal_buffer: List[np.ndarray] = []
+        self._cal_requested = False
+        self._calibrated_once = False
 
-        self.brain_data_sub = self.create_subscription(BrainData, '/brain/raw', self.receive_data, 100)
-        self.brain_action_pub = self.create_publisher(BrainActionMsg, '/brain/action', 10)
-        self.brainaction_metrics_pub = self.create_publisher(Float32MultiArray, '/brain/metrics', 10)
-        self.connected_sub = self.create_subscription(Bool, '/brain/connected', self._on_connected, 10)
+        # ---------- ROS I/O ----------
+        self.state_pub = self.create_publisher(Float32, '/brain/state', 20)
+        self.metrics_pub = self.create_publisher(Float32MultiArray, '/brain/metrics', 10) if self.publish_metrics else None
 
-        self.create_timer(1.0 / 5.0, self.process_tick)
+        # Subscriptions
+        self.create_subscription(BrainData, '/brain/raw', self._on_raw, 200)
+        self.create_subscription(Bool, '/brain/connected', self._on_connected, 10)
 
-        # Calibration settings
-        self.attempted_calibration = False
-        self.calibrating = False
-        self._calibration_buffer: List[np.ndarray] = []  # Stores samples during calibration
-    
+        # Processing timer
+        self.create_timer(1.0 / self.tick_hz, self._process_tick)
+
+        self.get_logger().info(
+            f"BrainProcessor up | fs={self.fs} Hz, buffer={self.buffer_sec}s, "
+            f"tick={self.tick_hz} Hz, mains={self.mains_hz} Hz"
+        )
+
+    # ------------------------- ROS callbacks -------------------------
+
     def _on_connected(self, msg: Bool) -> None:
-        if msg.data and not self.attempted_calibration and not self.calibrating and not self.use_default_thresholds:
-            self.get_logger().info("Brain device connected. Starting calibration...")
-            self.calibrate()
+        if msg.data and not self._calibrating and not self._calibrated_once and not self._cal_requested:
+            self._cal_requested = True
+            self.get_logger().info("Brain connected. Starting calibration thread…")
+            self._cal_thread = threading.Thread(target=self._calibration_thread, daemon=True)
+            self._cal_thread.start()
 
-    def receive_data(self, data: BrainData) -> None:
-        """Push a sample (or small chunk shaped (C,)) into the ring buffer."""
+    def _on_raw(self, data: BrainData) -> None:
         v = np.asarray(data.values, dtype=np.float64).reshape(-1)
         if v.size != self.C:
-            # tolerate AUX absence (C=4)
+            # tolerate missing AUX (C-1)
             if v.size == self.C - 1:
                 v = np.concatenate([v, [0.0]])
             else:
-                # wrong shape, drop
                 return
-        
-        # If calibrating, also store in calibration buffer
-        if self.calibrating:
-            self._calibration_buffer.append(v.copy())
-        
         self._push_row(v)
         self._last_data_time = self._now()
         self._data_stale_warned = False
 
-    def process_tick(self) -> None:
-        """
-        Call this at ~5–10 Hz (yours: 5 Hz). Computes features over the current
-        window and emits actions according to thresholds (after calibration).
-        """
-        if self._filled < int(self.fs * 1.5):  # wait until ~1.5s buffered
+        # If we are in a calibration phase, stash the sample
+        if self._calibrating:
+            with self._cal_buffer_lock:
+                self._cal_buffer.append(v.copy())
+
+    # --------------------------- Processing ---------------------------
+
+    def _process_tick(self) -> None:
+        # Need at least ~1.5 s of data to do anything
+        if self._filled < int(self.fs * 1.5):
             return
 
-        # Guard against stale feed
+        # Guard against stale input
         if self._last_data_time is not None:
-            stale_sec = self._now() - self._last_data_time
-            if stale_sec > 2.0:
+            stale = self._now() - self._last_data_time
+            if stale > 2.0:
                 if not self._data_stale_warned:
-                    self.get_logger().warning(
-                        f"Brain data stream stale for {stale_sec:.1f}s; skipping processing."
-                    )
+                    self.get_logger().warning(f"EEG feed stale for {stale:.1f}s; skipping.")
                     self._data_stale_warned = True
                 return
             else:
                 self._data_stale_warned = False
 
+        # Compute features on the current window
         alpha, beta, ratio = self._summarize_ratio(self._window())
 
-        # If not calibrated yet, log the ratio but don't emit actions
-        if self.r_low is None or self.r_high is None:
-            self.get_logger().info(
-                f"Not calibrated. Current ratio={ratio:.2f}, alpha={alpha:.1f}, beta={beta:.1f}"
-            )
+        # If not calibrated yet, publish nothing (or publish raw ratio as metric)
+        if self.r_relax is None or self.r_focus is None:
+            if self.metrics_pub:
+                m = Float32MultiArray()
+                m.data = [float('nan'), float('nan'), float(ratio), float(alpha), float(beta)]
+                self.metrics_pub.publish(m)
             return
 
-        # Decide action with hysteresis
-        new_state = self._state
-        if ratio > (self.r_boost or 9e9):
-            new_state = "BOOST"
-        elif ratio > (self.r_high or 9e9):
-            new_state = "FORWARD"
-        elif ratio < (self.r_low or -9e9):
-            new_state = "STOP"
-        else:
-            new_state = "IDLE"
-        
-        # Update state and always publish (not just on state changes)
-        self._state = new_state
-        msg = BrainActionMsg()
-        msg.stamp = float(self.get_clock().now().nanoseconds) * 1e-9
-        msg.action = new_state
-        msg.beta_alpha_ratio = float(ratio)
-        msg.alpha_power = float(alpha)
-        msg.beta_power = float(beta)
-        self._emit(msg)
-    
-    def calibrate(
-        self,
-        relaxed_sec: float = 10.0,
-        focus_sec: float = 10.0,
-    ) -> Tuple[float, float, float]:
-        """
-        Non-blocking calibration:
-          1) Relaxed (eyes closed) relaxed_sec seconds
-          2) Focus (mental math) focus_sec seconds
-        Returns (r_low, r_high, r_boost).
-        """
-        self.calibrating = True
-        
-        # Phase 1: Relaxed
-        min_relaxed_samples = max(10, int(relaxed_sec * self.fs * 0.5))
-        relaxed_ratios = self._collect_phase_ratios(
-            phase_name="RELAXED",
-            phase_index=1,
-            target_duration=relaxed_sec,
-            min_samples=min_relaxed_samples
-        )
+        # Normalize ratio → [0,1]
+        spread = max(self.r_focus - self.r_relax, self.min_spread)
+        state_raw = (ratio - self.r_relax) / spread
+        state_raw = float(np.clip(state_raw, 0.0, 1.0))
 
-        # Phase 2: Focus
-        min_focus_samples = max(10, int(focus_sec * self.fs * 0.5))
-        focus_ratios = self._collect_phase_ratios(
-            phase_name="FOCUS",
-            phase_index=2,
-            target_duration=focus_sec,
-            min_samples=min_focus_samples
-        )
+        # Smooth
+        now = self._now()
+        dt = max(1e-3, now - self._last_tick_time)
+        self._last_tick_time = now
+        # exponential smoothing coefficient from time constant tau
+        tau = max(1e-3, self.state_smooth_tau)
+        alpha_s = 1.0 - np.exp(-dt / tau)
+        self._state_smoothed = (1.0 - alpha_s) * self._state_smoothed + alpha_s * state_raw
 
-        if len(relaxed_ratios) < 5 or len(focus_ratios) < 5:
-            self.get_logger().warning(
-                f"Calibration aborted: collected {len(relaxed_ratios)} relaxed and {len(focus_ratios)} focus "
-                f"ratios (need at least 5 each)."
+        # Optional slow adaptation of anchors (drift handling)
+        if self.adapt_anchors:
+            if self._state_smoothed < self.edge_low:
+                # drift relaxed anchor toward current ratio very slowly
+                self.r_relax = (1.0 - self.adapt_rate) * self.r_relax + self.adapt_rate * ratio
+            elif self._state_smoothed > self.edge_high:
+                # drift focused anchor toward current ratio
+                self.r_focus = (1.0 - self.adapt_rate) * self.r_focus + self.adapt_rate * ratio
+            # maintain a minimum spread
+            if (self.r_focus - self.r_relax) < self.min_spread:
+                mid = 0.5 * (self.r_focus + self.r_relax)
+                self.r_relax = mid - 0.5 * self.min_spread
+                self.r_focus = mid + 0.5 * self.min_spread
+
+        # Publish state
+        out = Float32()
+        out.data = float(self._state_smoothed)
+        self.state_pub.publish(out)
+
+        # Optional metrics: [state_raw, state_smoothed, ratio, alpha, beta]
+        if self.metrics_pub:
+            m = Float32MultiArray()
+            m.data = [state_raw, self._state_smoothed, float(ratio), float(alpha), float(beta)]
+            self.metrics_pub.publish(m)
+
+    # --------------------------- Calibration --------------------------
+
+    def _calibration_thread(self):
+        """Two-phase calibration running off the executor thread."""
+        try:
+            self._calibrating = True
+            self.get_logger().info("Calibration: Phase 1/2 RELAXED (eyes closed).")
+            r_relax_samples = self._collect_phase_ratios(
+                phase_name="RELAXED",
+                duration=self.calib_relaxed_sec,
+                win_sec=2.0,
+                step_sec=0.5
             )
-            self.calibrating = False
-            return float('nan'), float('nan'), float('nan')
+            if len(r_relax_samples) < 5:
+                self.get_logger().error(
+                    f"Calibration failed: only {len(r_relax_samples)} relaxed windows."
+                )
+                self._calibrating = False
+                self._cal_requested = False
+                return
 
-        r_relax = float(np.median(relaxed_ratios))
-        r_focus = float(np.median(focus_ratios))
+            self.get_logger().info("Calibration: Phase 2/2 FOCUSED (mental math).")
+            r_focus_samples = self._collect_phase_ratios(
+                phase_name="FOCUSED",
+                duration=self.calib_focus_sec,
+                win_sec=2.0,
+                step_sec=0.5
+            )
+            if len(r_focus_samples) < 5:
+                self.get_logger().error(
+                    f"Calibration failed: only {len(r_focus_samples)} focused windows."
+                )
+                self._calibrating = False
+                self._cal_requested = False
+                return
 
-        # thresholds with buffer (hysteresis)
-        self.r_low   = (r_relax * 0.9 + r_focus * 0.1)
-        self.r_high  = (r_relax * 0.3 + r_focus * 0.7)
-        self.r_boost = (r_focus * 1.2)
-        self.attempted_calibration = True
-        self.calibrating = False
+            # Robust anchors: use medians
+            r_relax = float(np.median(r_relax_samples))
+            r_focus = float(np.median(r_focus_samples))
 
-        self.get_logger().info(
-            f"[BrainProcessor] Calibration complete. "
-            f"Relaxed ratio ~{r_relax:.2f}, Focused ratio ~{r_focus:.2f}. "
-            f"Set thresholds: low={self.r_low:.2f}, high={self.r_high:.2f}, boost={self.r_boost:.2f}"
-        )
+            # Ensure a reasonable spread
+            spread = r_focus - r_relax
+            if spread < self.min_spread:
+                self.get_logger().warn(
+                    f"Calibration spread too small ({spread:.3f}); enforcing min_spread={self.min_spread:.3f}."
+                )
+                mid = 0.5 * (r_focus + r_relax)
+                r_relax = mid - 0.5 * self.min_spread
+                r_focus = mid + 0.5 * self.min_spread
 
-        return self.r_low, self.r_high, self.r_boost
+            self.r_relax = r_relax
+            self.r_focus = r_focus
+            self._calibrated_once = True
 
-    # ----------------- Internals -----------------
+            # Set initial smoothed state near relaxed
+            self._state_smoothed = 0.0
+
+            self.get_logger().info(
+                f"Calibration done: r_relax≈{self.r_relax:.2f}, r_focus≈{self.r_focus:.2f}, "
+                f"spread≈{(self.r_focus - self.r_relax):.2f}"
+            )
+        finally:
+            self._calibrating = False
+            self._cal_requested = False
+
+    def _collect_phase_ratios(
+        self,
+        phase_name: str,
+        duration: float,
+        win_sec: float,
+        step_sec: float
+    ) -> List[float]:
+        """Collect Beta/Alpha ratios for a phase by recording raw samples, then sliding-window PSD."""
+        # clear buffer for this phase
+        with self._cal_buffer_lock:
+            self._cal_buffer.clear()
+
+        # announce and give users a brief second to settle
+        self.get_logger().info(f"Phase {phase_name}: starting in 1s…")
+        time.sleep(1.0)
+
+        # collect for 'duration' seconds
+        t0 = time.time()
+        while (time.time() - t0) < duration and rclpy.ok():
+            time.sleep(0.01)  # allow subscriber to fill _cal_buffer
+
+        # snapshot
+        with self._cal_buffer_lock:
+            cal = np.array(self._cal_buffer, dtype=np.float64)
+
+        if cal.shape[0] < int(0.5 * duration * self.fs):
+            self.get_logger().warn(
+                f"Phase {phase_name}: low sample count: {cal.shape[0]}."
+            )
+
+        ratios: List[float] = []
+        if cal.shape[0] == 0:
+            return ratios
+
+        w = int(max(1, round(win_sec * self.fs)))
+        s = int(max(1, round(step_sec * self.fs)))
+        for i in range(0, cal.shape[0] - w + 1, s):
+            window = cal[i:i+w, :]
+            _, _, r = self._summarize_ratio(window)
+            ratios.append(float(r))
+
+        self.get_logger().info(f"Phase {phase_name}: computed {len(ratios)} ratio windows.")
+        return ratios
+
+    # ------------------------- Internals -------------------------
 
     def _idx(self, name: str) -> int:
         mapping = {n: i for i, n in enumerate(self.labels)}
-        # fallbacks for default Muse
         defaults = {"TP9": 0, "AF7": 1, "AF8": 2, "TP10": 3, "AUX": 4}
         return mapping.get(name, defaults[name])
 
     def _summarize_ratio(self, win: np.ndarray) -> Tuple[float, float, float]:
         fs = self.fs
-        # filter per channel
         filt = np.empty_like(win)
         for c in range(win.shape[1]):
             x = win[:, c]
@@ -269,19 +380,17 @@ class BrainProcessor(Node):
         af7  = filt[:, self._idx("AF7")]
         af8  = filt[:, self._idx("AF8")]
 
-        alpha = 0.5 * (_bandpower_welch(tp9, fs, *self.alpha) +
-                       _bandpower_welch(tp10, fs, *self.alpha))
-        beta  = 0.5 * (_bandpower_welch(af7, fs, *self.beta)  +
-                       _bandpower_welch(af8, fs, *self.beta))
-
+        alpha = 0.5 * (_bandpower_welch(tp9, fs, *self.alpha_band) +
+                       _bandpower_welch(tp10, fs, *self.alpha_band))
+        beta  = 0.5 * (_bandpower_welch(af7, fs, *self.beta_band)  +
+                       _bandpower_welch(af8, fs, *self.beta_band))
         ratio = beta / (alpha + 1e-9)
         return alpha, beta, ratio
 
     def _push_row(self, row: np.ndarray) -> None:
-        S = self.S
         self._rb[self._write, :] = row
-        self._write = (self._write + 1) % S
-        self._filled = min(S, self._filled + 1)
+        self._write = (self._write + 1) % self.S
+        self._filled = min(self.S, self._filled + 1)
 
     def _window(self) -> np.ndarray:
         if self._filled < self.S:
@@ -290,111 +399,11 @@ class BrainProcessor(Node):
             return self._rb
         return np.vstack((self._rb[self._write:, :], self._rb[:self._write, :]))
 
-    def _emit(self, msg: BrainActionMsg) -> None:
-        if self._action_cb:
-            self._action_cb(msg)
-        
-        # Publish the action message
-        self.brain_action_pub.publish(msg)
-        
-        # Publish metrics as Float32MultiArray
-        metrics = Float32MultiArray()
-        metrics.data = [msg.beta_alpha_ratio, msg.alpha_power, msg.beta_power]
-        self.brainaction_metrics_pub.publish(metrics)
-        
-        self.get_logger().debug(
-            f"[BrainProcessor] {msg.action:7s}  R={msg.beta_alpha_ratio:5.2f}  "
-            f"α={msg.alpha_power:7.1f}  β={msg.beta_power:7.1f}"
-        )
-
     def _now(self) -> float:
-        """Return current time in seconds."""
         return float(self.get_clock().now().nanoseconds) * 1e-9
-
-    def _wait_for_buffer(self, min_seconds: float, timeout: float) -> bool:
-        """Block until at least `min_seconds` of samples are buffered or timeout occurs."""
-        if min_seconds <= 0:
-            return True
-
-        needed_samples = int(self.fs * min_seconds)
-        start = self._now()
-
-        while rclpy.ok() and self._filled < needed_samples:
-            if (self._now() - start) >= timeout:
-                return False
-            rclpy.spin_once(self, timeout_sec=0.05)
-
-        return self._filled >= needed_samples
-
-    def _collect_phase_ratios(
-        self,
-        phase_name: str,
-        phase_index: int,
-        target_duration: float,
-        min_samples: int,
-    ) -> List[float]:
-        """Collect beta/alpha ratios for a calibration phase by waiting then computing from buffer."""
-        # Clear calibration buffer for this phase
-        self._calibration_buffer.clear()
-        
-        self.get_logger().info(
-            f"[BrainProcessor] Prepare for phase {phase_index}: {phase_name}."
-        )
-        
-        # Countdown
-        for i in range(3, 0, -1):
-            self.get_logger().info(
-                f"[BrainProcessor] Calibration phase {phase_index}: {phase_name} starting in {i}..."
-            )
-            self.get_clock().sleep_for(Duration(seconds=1))
-            rclpy.spin_once(self, timeout_sec=0.0)
-
-        # Start collecting data
-        self.calibrating = True
-        phase_start = self._now()
-        
-        self.get_logger().info(
-            f"[BrainProcessor] Collecting {phase_name} data for {target_duration}s..."
-        )
-        
-        # Wait for the full duration while spinning to receive data
-        while rclpy.ok() and (self._now() - phase_start) < target_duration:
-            rclpy.spin_once(self, timeout_sec=0.01)
-        
-        # Stop collecting for this phase
-        self.calibrating = False
-        
-        # Now compute ratios from the collected buffer
-        ratios: List[float] = []
-        if len(self._calibration_buffer) < min_samples:
-            self.get_logger().warning(
-                f"[BrainProcessor] Phase {phase_index} ({phase_name}) captured {len(self._calibration_buffer)} samples; "
-                f"needed {min_samples}."
-            )
-            return ratios
-        
-        # Convert buffer to numpy array
-        cal_data = np.array(self._calibration_buffer)
-        
-        # Compute ratios using sliding windows
-        window_size = int(2 * self.fs)  # 2 second windows
-        step_size = int(0.5 * self.fs)  # 0.5 second steps
-        
-        for i in range(0, len(cal_data) - window_size + 1, step_size):
-            window = cal_data[i:i+window_size, :]
-            if window.shape[0] >= window_size:
-                _, _, ratio = self._summarize_ratio(window)
-                ratios.append(float(ratio))
-        
-        self.get_logger().info(
-            f"[BrainProcessor] Phase {phase_index} ({phase_name}) computed {len(ratios)} ratios from {len(cal_data)} samples."
-        )
-        
-        return ratios
 
 
 def main(args=None):
-    """Main entry point for the brain_processor node."""
     rclpy.init(args=args)
     node = BrainProcessor()
     try:

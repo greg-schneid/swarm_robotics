@@ -13,7 +13,7 @@ from rclpy.node import Node
 import subprocess
 from std_msgs.msg import Float32MultiArray, Bool
 
-from swarm_messages.msg import BrainData, BrainActionMsg
+from swarm_messages.msg import BrainData
 
 class BrainStream(Node):
     def __init__(self, process_frequency: int = 5, mains_hz: float = 60.0, summary_period: float = 5.0):
