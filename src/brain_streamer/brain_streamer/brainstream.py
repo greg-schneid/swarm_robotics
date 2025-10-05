@@ -1,5 +1,8 @@
+import csv
+import os
 import threading
 import time
+from datetime import datetime
 from queue import Queue
 from typing import List, Optional
 
@@ -21,6 +24,20 @@ class BrainStream(Node):
         self.data_queue: "Queue[BrainData]" = Queue(maxsize=10000)
         self.shutdown_event = threading.Event()
 
+        # Declare and get ROS parameter for CSV logging
+        self.declare_parameter('save_to_csv', False)
+        self.declare_parameter('csv_output_dir', '/workspaces/swarm_robotics/data')
+        self.save_to_csv = self.get_parameter('save_to_csv').value
+        self.csv_output_dir = self.get_parameter('csv_output_dir').value
+        
+        # CSV file handling
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_lock = threading.Lock()
+        
+        if self.save_to_csv:
+            self._initialize_csv()
+
         # Publishers for raw data and processed outputs
         self.raw_pub = self.create_publisher(BrainData, '/brain/raw', 50)
         self.average_pub = self.create_publisher(Float32MultiArray, 'brain/raw_average', 10)
@@ -39,6 +56,30 @@ class BrainStream(Node):
 
         # ROS timer for summaries
         self.create_timer(self.summary_period, self.publish_data)
+
+    def _initialize_csv(self):
+        """Initialize CSV file for logging raw brain data."""
+        try:
+            # Create output directory if it doesn't exist
+            os.makedirs(self.csv_output_dir, exist_ok=True)
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            csv_filename = f'brain_data_{timestamp}.csv'
+            csv_path = os.path.join(self.csv_output_dir, csv_filename)
+            
+            # Open CSV file and create writer
+            self.csv_file = open(csv_path, 'w', newline='', buffering=1)  # Line buffering
+            self.csv_writer = csv.writer(self.csv_file)
+            
+            # Write header
+            header = ['timestamp'] + self.labels
+            self.csv_writer.writerow(header)
+            
+            self.get_logger().info(f'CSV logging enabled. Saving to: {csv_path}')
+        except Exception as e:
+            self.get_logger().error(f'Failed to initialize CSV file: {e}')
+            self.save_to_csv = False
 
     def _start_stream(self):
         self.get_logger().info('Starting muselsl stream…')
@@ -74,6 +115,15 @@ class BrainStream(Node):
     def stop(self):
         self.shutdown_event.set()
         time.sleep(0.05)
+        
+        # Close CSV file if open
+        if self.csv_file:
+            try:
+                with self.csv_lock:
+                    self.csv_file.close()
+                    self.get_logger().info('CSV file closed successfully.')
+            except Exception as e:
+                self.get_logger().error(f'Error closing CSV file: {e}')
     
     def _stop_stream(self):
         # Close the subprocess when the object is deleted
@@ -111,6 +161,17 @@ class BrainStream(Node):
             data.timestamp = float(ts)
             data.values = [float(v) for v in sample]
 
+            self.raw_pub.publish(data)
+            
+            # Write to CSV if enabled
+            if self.save_to_csv and self.csv_writer:
+                try:
+                    with self.csv_lock:
+                        row = [data.timestamp] + data.values
+                        self.csv_writer.writerow(row)
+                except Exception as e:
+                    self.get_logger().error(f'Failed to write to CSV: {e}')
+
             try:
                 self.data_queue.put_nowait(data)
             except Exception:
@@ -120,9 +181,6 @@ class BrainStream(Node):
                 except Exception:
                     pass
                 self.data_queue.put_nowait(data)
-
-            # Publish ROS2 BrainData message
-            self.raw_pub.publish(data)
 
 
     def publish_data(self):
@@ -177,6 +235,13 @@ class BrainStream(Node):
     
     def __del__(self):
         self.stop()
+        
+        # Ensure CSV file is closed
+        if self.csv_file and not self.csv_file.closed:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass
 
 
 def main(args=None):

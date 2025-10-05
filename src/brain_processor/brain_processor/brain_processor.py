@@ -53,6 +53,7 @@ class BrainProcessor(Node):
         buffer_sec: float = 4.0,                       # processing window
         mains_hz: float = 60.0,                       # set 50.0 if needed
         action_callback: Optional[Callable[[BrainActionMsg], None]] = None,
+        use_default_thresholds: bool = True,          # use defaults immediately
     ):
         super().__init__('brain_processor')
         self.fs = float(sample_rate)
@@ -65,10 +66,21 @@ class BrainProcessor(Node):
         self._write = 0
         self._filled = 0
 
-        # thresholds learned in calibrate()
-        self.r_low: Optional[float] = None
-        self.r_high: Optional[float] = None
-        self.r_boost: Optional[float] = None
+        # thresholds learned in calibrate() or set to defaults
+        if use_default_thresholds:
+            # Default thresholds based on typical Beta/Alpha ratios
+            # These work reasonably well but calibration is recommended for best results
+            self.r_low: Optional[float] = 0.8    # Below this = STOP (very relaxed)
+            self.r_high: Optional[float] = 1.5   # Above this = FORWARD (focused)
+            self.r_boost: Optional[float] = 2.5  # Above this = BOOST (highly focused)
+            self.get_logger().info(
+                f"Using default thresholds: low={self.r_low:.2f}, high={self.r_high:.2f}, boost={self.r_boost:.2f}"
+            )
+        else:
+            self.r_low: Optional[float] = None
+            self.r_high: Optional[float] = None
+            self.r_boost: Optional[float] = None
+            self.get_logger().warn("Calibration required before publishing actions.")
 
         # bands
         self.alpha = (8.0, 13.0)
@@ -94,9 +106,7 @@ class BrainProcessor(Node):
 
         # Calibration settings
         self.attempted_calibration = False
-        
-
-    # ----------------- Public API -----------------
+        self.calibrateing = False
 
     def receive_data(self, data: BrainData) -> None:
         """Push a sample (or small chunk shaped (C,)) into the ring buffer."""
@@ -120,9 +130,11 @@ class BrainProcessor(Node):
 
         alpha, beta, ratio = self._summarize_ratio(self._window())
 
-        # If not calibrated yet, just print/debug
+        # If not calibrated yet, log the ratio but don't emit actions
         if self.r_low is None or self.r_high is None:
-            # no action yet
+            self.get_logger().info(
+                f"Not calibrated. Current ratio={ratio:.2f}, alpha={alpha:.1f}, beta={beta:.1f}"
+            )
             return
 
         # Decide action with hysteresis
@@ -135,7 +147,7 @@ class BrainProcessor(Node):
             new_state = "STOP"
         else:
             new_state = "IDLE"
-
+        
         if new_state != self._state:
             self._state = new_state
             msg = BrainActionMsg()
@@ -283,17 +295,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-    def _now(self) -> float:
-        """Return current time in seconds."""
-        return float(self.get_clock().now().nanoseconds) * 1e-9
-
-if __name__ == '__main__':
-    rclpy.init()
-    node = BrainProcessor()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        rclpy.shutdown()
