@@ -7,10 +7,17 @@ pip install muselsl
 pip install -U bleak muselsl
 ```
 
+
+Command to stream data
+```bash
+muselsl stream --backend bleak
+```
+
+
        # Optional: do a quick, blocking calibration at startup
         self.get_logger().info('Calibration starting…')
         time.sleep(2.0)  # Pre-fill buffer ~2 s before we calibrate
-        try:
+        try:~
             self.processor.calibrate(relaxed_sec=10.0, focus_sec=10.0, interactive=False, logger=self.get_logger().info)
             self.get_logger().info('Calibration complete.')
         except RuntimeError as exc:

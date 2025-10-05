@@ -139,7 +139,7 @@ class BrainProcessor(Node):
         if new_state != self._state:
             self._state = new_state
             msg = BrainActionMsg()
-            msg.stamp = self._now()
+            msg.stamp = float(self.get_clock().now().nanoseconds) * 1e-9
             msg.action = new_state
             msg.beta_alpha_ratio = float(ratio)
             msg.alpha_power = float(alpha)
@@ -150,8 +150,7 @@ class BrainProcessor(Node):
         self,
         relaxed_sec: float = 10.0,
         focus_sec: float = 10.0,
-        interactive: bool = True,
-        logger: Optional[Callable[[str], None]] = None,
+        interactive: bool = True,   # if False, no input() prompts
     ) -> Tuple[float, float, float]:
         """
         Blocking calibration:
@@ -159,7 +158,7 @@ class BrainProcessor(Node):
           2) Focus (mental math) focus_sec seconds
         Returns (r_low, r_high, r_boost).
         """
-        log = logger if logger else print
+        self.calibrateing = True
         
         # Accumulate ratios during two phases
         relaxed_ratios: List[float] = []
@@ -169,7 +168,7 @@ class BrainProcessor(Node):
         if interactive:
             input(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s. Enter when ready...")
         else:
-            log(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s starting now.")
+            self.get_logger().info(f"[BrainProcessor] Calibration phase 1: RELAXED for ~{relaxed_sec:.1f} s starting now.")
         
         t0 = self._now()
         while self._now() - t0 < relaxed_sec:
@@ -181,7 +180,7 @@ class BrainProcessor(Node):
         if interactive:
             input(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s. Enter when ready...")
         else:
-            log(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s starting now.")
+            self.get_logger().info(f"[BrainProcessor] Calibration phase 2: FOCUS for ~{focus_sec:.1f} s starting now.")
 
         t0 = self._now()
         while self._now() - t0 < focus_sec:
@@ -199,7 +198,8 @@ class BrainProcessor(Node):
         self.r_low   = (r_relax * 0.9 + r_focus * 0.1)
         self.r_high  = (r_relax * 0.3 + r_focus * 0.7)
         self.r_boost = (r_focus * 1.2)
-
+        self.attempted_calibration = True
+        self.calibrateing = False
         return self.r_low, self.r_high, self.r_boost
 
     # ----------------- Internals -----------------
@@ -262,6 +262,27 @@ class BrainProcessor(Node):
             f"[BrainProcessor] {msg.action:7s}  R={msg.beta_alpha_ratio:5.2f}  "
             f"α={msg.alpha_power:7.1f}  β={msg.beta_power:7.1f}"
         )
+
+    def _now(self) -> float:
+        """Return current time in seconds."""
+        return float(self.get_clock().now().nanoseconds) * 1e-9
+
+
+def main(args=None):
+    """Main entry point for the brain_processor node."""
+    rclpy.init(args=args)
+    node = BrainProcessor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
 
     def _now(self) -> float:
         """Return current time in seconds."""

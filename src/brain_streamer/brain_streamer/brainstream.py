@@ -22,7 +22,7 @@ class BrainStream(Node):
         self.shutdown_event = threading.Event()
 
         # Publishers for raw data and processed outputs
-        self.raw_pub = self.create_publisher(Float32MultiArray, '/brain/raw', 50)
+        self.raw_pub = self.create_publisher(BrainData, '/brain/raw', 50)
         self.average_pub = self.create_publisher(Float32MultiArray, 'brain/raw_average', 10)
 
         # LSL stream objects

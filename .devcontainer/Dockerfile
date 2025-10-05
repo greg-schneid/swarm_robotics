@@ -19,13 +19,17 @@ RUN apt-get update && apt-get install -y \
     sudo \
     bash-completion \
     build-essential \
+    bluez bluez-tools bluetooth rfkill dbus \
     && rm -rf /var/lib/apt/lists/*
 
 # Install liblsl - required for muselsl
-RUN wget https://github.com/sccn/liblsl/releases/download/v1.16.2/liblsl-1.16.2-jammy_amd64.deb \
-    && dpkg -i liblsl-1.16.2-jammy_amd64.deb || true \
-    && apt-get install -f -y \
-    && rm liblsl-1.16.2-jammy_amd64.deb
+RUN wget -q https://github.com/sccn/liblsl/releases/download/v1.16.2/liblsl-1.16.2-noble_amd64.deb \
+ && apt-get update \
+ && apt-get install -y ./liblsl-1.16.2-noble_amd64.deb \
+ && rm -f liblsl-1.16.2-noble_amd64.deb
+
+# Make sure pylsl knows exactly where liblsl is
+ENV PYLSL_LIB=/usr/lib/x86_64-linux-gnu/liblsl.so.1.16.2
 
 # Install Python packages for Muse EEG streaming
 RUN pip3 install --no-cache-dir --break-system-packages muselsl bleak numpy pylsl

@@ -21,13 +21,21 @@
   "workspaceFolder": "/workspaces/swarm_robotics",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/swarm_robotics,type=bind",
   "mounts": [
+    "source=/var/run/dbus,target=/var/run/dbus,type=bind",
     "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/ubuntu/.ssh,type=bind,consistency=cached",
     "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/ubuntu/.gitconfig,type=bind,consistency=cached"
   ],
   "postCreateCommand": "bash -c 'sudo chown -R ubuntu:ubuntu /workspaces/swarm_robotics 2>/dev/null || true && mkdir -p /workspaces/swarm_robotics/src && echo \"if [ -f /workspaces/swarm_robotics/install/setup.bash ]; then source /workspaces/swarm_robotics/install/setup.bash; fi\" >> ~/.bashrc && source /opt/ros/jazzy/setup.bash'",
   "containerEnv": {
-    "GIT_EDITOR": "nano"
+    "GIT_EDITOR": "nano",
+    "PYLSL_LIB": "/usr/lib/x86_64-linux-gnu/liblsl.so.1.16.2"
   },
+  "runArgs": [
+    "--net=host",                              
+    "--cap-add=NET_ADMIN",
+    "--device=/dev/bus/usb:/dev/bus/usb",
+    "--env=PYLSL_LIB=/usr/lib/x86_64-linux-gnu/liblsl.so.1.16.2"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
