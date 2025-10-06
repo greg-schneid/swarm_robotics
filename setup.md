@@ -7,12 +7,35 @@ pip install muselsl
 pip install -U bleak muselsl
 ```
 
+# How to Run
 
-Command to stream data
+1. Start the stream of data
+
+Command to stream data -- do this in one terminal
+
 ```bash
 muselsl stream --backend bleak
 ```
 
+2. Once a connection is established, launch the ros2 nodes:
+```bash
+ros2 launch brain_streamer brain_system.launch.py
+```
+
+3. Check out raw data stream
+``` bash
+ros2 topic echo /brain.state
+```
+
+4. launch the data_streamer!!
+``` bash
+ros2 run data_streamer data_streamer --ros-args -p dest_host:=192.168.10.15 -p dest_port:=5005 -p broadcast:=true
+```
+
+5. make sure all nodes are present (i.e. brain_processor + brain_stream + data_streamer are all present)
+``` bash
+ros2 node list
+```
 
        # Optional: do a quick, blocking calibration at startup
         self.get_logger().info('Calibration starting…')
